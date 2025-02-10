@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python
 
 import numpy as np
 import json
@@ -38,6 +38,10 @@ def main():
     parser.add_argument("-q", "--queue", choices=["red", "green", "blue"], default="blue", help="SLURM queue for jobs")
     parser.add_argument("--no-mem", action="store_true", help="don't set a memory cap in the SLURM script (use for large bins where the generated MC is a huge file")
     parser.add_argument("--time-limit", action="store_true", help="add 4-hour time limit to SLURM job")
+    parser.add_argument("--MPI", action="store_true", help="utilize openMP to perform fits (make sure environment set up correctly)")
+    parser.add_argument("--num-ntasks", type=int, default=32, help="Number of MPI tasks for parallel execution")
+    parser.add_argument("-r", "--random-fits", type=int, nargs="?", const=1, default=0, help="let AmpTools handle randomized fits to perform (default: 1 if flag is used without an argument)")
+    parser.add_argument("-t", "--test", action="store_true", help="print amplitude details for the first 2 data events")
     args = parser.parse_args()
     # np.random.seed(int(args.seed)) move this down
     queue = queues[args.queue]
@@ -105,38 +109,62 @@ def main():
     slurm_path = Path(study['directory']) / f"dispatch_{args.config}.csh"
     with open(slurm_path, 'w') as slurm_file:
         lines = ["#!/bin/tcsh -f\n"]
-        lines.append(f"#SBATCH --ntasks={queue['threads']}\n")
+        if args.MPI:
+            lines.append(f"#SBATCH --ntasks={args.num_ntasks}\n")
+        else:
+            lines.append(f"#SBATCH --ntasks={queue['threads']}\n")
         lines.append(f"#SBATCH --partition={args.queue}\n")
         if not args.no_mem:
             lines.append(f"#SBATCH --mem={queue['threads'] * queue['cpu']}\n")
         if args.time_limit:
             lines.append("#SBATCH --time=4:00:00\n")
         lines.append(f"#SBATCH --output={study['directory']}/{args.config}/log_{args.config}_%A.log\n")
+        lines.append(f"#SBATCH --error={study['directory']}/{args.config}/err_{args.config}_%A.err\n")
         lines.append("#SBATCH --quiet\n")
         lines.append(f"#SBATCH --array={iterations[0]}-{iterations[-1]}\n")
         lines.append("pwd; hostname; date; whoami\n")
         lines.append("echo $SLURM_ARRAY_TASK_ID\n")
         lines.append(f"cd {study['directory']}/{args.config}/$1/$SLURM_ARRAY_TASK_ID\n")
-        lines.append(f"fit -c {args.config}_${{1}}-${{SLURM_ARRAY_TASK_ID}}.cfg\n")
+
+        lines.append("ulimit -a\n")
+
+        if args.random_fits and args.random_fits > 0:
+            random_fits_flag = f"-r {args.random_fits}"
+        else:
+            random_fits_flag = ""
+
+        if args.test:
+            lines.append(f"fit -test -c {args.config}_${{1}}-${{SLURM_ARRAY_TASK_ID}}.cfg\n")
+        elif args.MPI:
+            lines.append(f"mpirun -np {args.num_ntasks} --mca btl_openib_allow_ib 1 fitMPI -c {args.config}_${{1}}-${{SLURM_ARRAY_TASK_ID}}.cfg -s {args.config}_params.dat -m 75000 {random_fits_flag}\n")
+        else:
+            lines.append(f"fit -c {args.config}_${{1}}-${{SLURM_ARRAY_TASK_ID}}.cfg {random_fits_flag}\n")
         lines.append("echo DONE!; date")
         slurm_file.writelines(lines)
 
-
-    # Run fits
     if not args.skip_fit:
         job_names = []
         for i_bin in tqdm(range(study['nbins'])):
             subprocess.run(["sbatch", "-J", f"{args.config}_{str(i_bin)}", str(slurm_path), str(i_bin)])
             job_names.append(f"{args.config}_{i_bin}")
-        # Wait for all jobs to finish running
-        running = True
-        while running:
-            n_jobs_running, n_jobs_in_queue = amputils.check_SLURM(job_names)
-            print(f"{n_jobs_in_queue:4} job(s) in queue | {n_jobs_running:4} job(s) running", end="\r")
-            if n_jobs_in_queue == 0:
-                running = False
-            time.sleep(2) # don't check it so often
-        print()
+
+        sys.exit(0)
+
+    # Run fits
+    #if not args.skip_fit:
+    #    job_names = []
+    #    for i_bin in tqdm(range(study['nbins'])):
+    #        subprocess.run(["sbatch", "-J", f"{args.config}_{str(i_bin)}", str(slurm_path), str(i_bin)])
+    #        job_names.append(f"{args.config}_{i_bin}")
+    #    # Wait for all jobs to finish running
+    #    running = True
+    #    while running:
+    #        n_jobs_running, n_jobs_in_queue = amputils.check_SLURM(job_names)
+    #        print(f"{n_jobs_in_queue:4} job(s) in queue | {n_jobs_running:4} job(s) running", end="\r")
+    #        if n_jobs_in_queue == 0:
+    #            running = False
+    #        time.sleep(2) # don't check it so often
+    #    print()
     # Collect results
     res_path = Path(study['directory']) / f"{args.config}_results.csv"
     df = pd.DataFrame()
